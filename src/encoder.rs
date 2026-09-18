@@ -50,17 +50,14 @@ pub struct EncoderConfig {
     layers_per_block: usize,
     #[config(default = 32)]
     norm_num_groups: usize,
-    #[config(default = 4)]
-    num_down_blocks: usize,
-    #[config(default = 4)]
-    num_up_blocks: usize,
 }
 
 impl EncoderConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Encoder<B> {
         let mut down_blocks = vec![];
         let mut output_channel = self.block_out_channels[0];
-        for i in 0..self.num_down_blocks {
+        let num_down_blocks = self.block_out_channels.len();
+        for i in 0..num_down_blocks {
             let input_channel = output_channel;
             output_channel = self.block_out_channels[i];
             let is_final_block = i == self.block_out_channels.len() - 1;
@@ -78,7 +75,7 @@ impl EncoderConfig {
             );
         }
 
-        let last_block_out_size = self
+        let block_out_channel_last = self
             .block_out_channels
             .last()
             .expect("block_out_channels should not be empty!")
@@ -88,12 +85,16 @@ impl EncoderConfig {
                 .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .init(device),
             down_blocks,
-            mid_block: UNetMidBlock2DConfig::new(last_block_out_size, 1e-6, self.norm_num_groups)
-                .init(device),
-            conv_norm_out: GroupNormConfig::new(self.norm_num_groups, last_block_out_size)
+            mid_block: UNetMidBlock2DConfig::new(
+                block_out_channel_last,
+                1e-6,
+                self.norm_num_groups,
+            )
+            .init(device),
+            conv_norm_out: GroupNormConfig::new(self.norm_num_groups, block_out_channel_last)
                 .with_epsilon(1e-6)
                 .init(device),
-            conv_out: Conv2dConfig::new([last_block_out_size, 2 * self.out_channels], [3, 3])
+            conv_out: Conv2dConfig::new([block_out_channel_last, 2 * self.out_channels], [3, 3])
                 .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .init(device),
         }

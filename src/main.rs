@@ -1,41 +1,37 @@
-use std::time::Instant;
-
-use crate::encoder::EncoderConfig;
+use crate::vae::VAEConfig;
 use burn::{Tensor, backend::Wgpu};
 use burn_store::{KeyRemapper, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
-use image::GenericImageView;
+use image::{GenericImageView, Rgb, RgbImage};
 
 mod attention;
+mod decoder;
 mod downsampling;
 mod encoder;
 mod resnet;
 mod unet_2d_blocks;
+mod upsampling;
+mod vae;
 
 fn main() {
     type MyBackend = Wgpu<f32, i32>;
     let device = Default::default();
     let block_out_channels = vec![128, 256, 512, 512];
-    let mut encoder = EncoderConfig::new(block_out_channels).init::<MyBackend>(&device);
+    let mut vae = VAEConfig::new(block_out_channels).init::<MyBackend>(&device);
 
     let remapper = KeyRemapper::new()
-        .add_pattern(r"^encoder\.", r"")
-        .unwrap()
-        .add_pattern(r"\.downsamplers\.0\.", ".downsampler.")
-        .unwrap()
         .add_pattern(r"\.to_out\.0\.", ".to_out.")
         .unwrap();
 
     let mut store = SafetensorsStore::from_file("vae_f32.safetensors")
-        // .with_regex(r"^encoder\..*")
         .remap(remapper)
         .with_from_adapter(PyTorchToBurnAdapter);
 
-    let result = encoder.load_from(&mut store).unwrap();
-    println!("{:?}\n\n", encoder);
+    let result = vae.load_from(&mut store).unwrap();
+    println!("{:?}\n\n", vae);
     println!("{}", result);
 
     println!("Applied: {} tensors", result.applied.len());
-    assert_eq!(result.applied.len(), 106, "Encoder weights didn't load");
+    assert_eq!(result.applied.len(), 244, "Weights didn't load");
     println!("Missing: {:?}", result.missing);
     println!("Errors: {:?}", result.errors);
 
@@ -43,42 +39,46 @@ fn main() {
         println!("All tensors loaded successfully");
     }
 
-    let img = image::open("image.png")
-        .expect("Failed to open dean.webp")
-        .resize_exact(768, 768, image::imageops::FilterType::Lanczos3);
+    let img = image::open("image.png").expect("Failed to open image");
 
-    let mut pixels = Vec::with_capacity(3 * 768 * 768);
+    let (width, height) = img.dimensions();
+
+    let mut pixels = Vec::with_capacity(3 * width as usize * height as usize);
     for c in 0..3 {
-        for y in 0..768 {
-            for x in 0..768 {
+        for y in 0..height {
+            for x in 0..width {
                 let p = img.get_pixel(x, y).0[c];
                 pixels.push((p as f32 / 127.5) - 1.0);
             }
         }
     }
-    let input =
-        Tensor::<MyBackend, 1>::from_floats(pixels.as_slice(), &device).reshape([1, 3, 768, 768]);
 
-    let mut output = encoder.forward(input.clone());
-    for _ in 0..2 {
-        output = encoder.forward(input.clone());
+    let input = Tensor::<MyBackend, 1>::from_floats(pixels.as_slice(), &device)
+        .reshape([1, 3, height, width]);
+
+    let output = vae.forward(input.clone());
+    let [_b, _c, h, w] = output.dims();
+
+    let out_data = output
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .expect("Failed to convert tensor to vector");
+
+    let hw = h * w;
+    let mut reconstructed = RgbImage::new(w as u32, h as u32);
+
+    // Map NCHW into interleaved RGB pixels
+    for y in 0..h {
+        for x in 0..w {
+            let idx = y * w + x;
+            let r = ((out_data[0 * hw + idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+            let g = ((out_data[1 * hw + idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+            let b = ((out_data[2 * hw + idx] + 1.0) * 127.5).clamp(0.0, 255.0) as u8;
+            reconstructed.put_pixel(x as u32, y as u32, Rgb([r, g, b]));
+        }
     }
-
-    const N: usize = 10;
-    let mut total = std::time::Duration::ZERO;
-    for _ in 0..N {
-        let start = Instant::now();
-        output = encoder.forward(input.clone());
-        // let _ = output.clone().into_data();
-        total += start.elapsed();
-    }
-    println!("Avg. over {} runs {:?}", N, total / N as u32);
-
-    println!("Output shape: {:?}", output.dims());
-
-    let out_data = output.into_data().convert::<f32>().to_vec::<f32>().unwrap();
-    println!("Rust Encoder (First 10): {:.4?}", &out_data[..10]);
-    let bytes: &[u8] = bytemuck::cast_slice(&out_data);
-    std::fs::write("rust_latents.bin", bytes).expect("Failed to write latents");
-    println!("Latents successfully saved to rust_latents.bin!");
+    reconstructed
+        .save("reconstructed.png")
+        .expect("Failed to save reconstructed image");
 }

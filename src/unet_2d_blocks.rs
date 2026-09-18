@@ -6,13 +6,14 @@ use crate::{
     attention::{Attention, AttentionConfig},
     downsampling::{Downsample2D, Downsample2DConfig},
     resnet::{ResnetBlock2D, ResnetBlock2DConfig},
+    upsampling::{Upsample2D, Upsample2DConfig},
 };
 
 // Reference: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_2d_blocks.py#L1372
 #[derive(Module, Debug)]
 pub struct DownEncoderBlock2D<B: Backend> {
     resnets: Vec<ResnetBlock2D<B>>,
-    downsampler: Option<Downsample2D<B>>,
+    downsamplers: Vec<Downsample2D<B>>,
 }
 
 impl<B: Backend> DownEncoderBlock2D<B> {
@@ -20,7 +21,7 @@ impl<B: Backend> DownEncoderBlock2D<B> {
         for resnet in &self.resnets {
             hidden_states = resnet.forward(hidden_states);
         }
-        if let Some(downsampler) = &self.downsampler {
+        for downsampler in &self.downsamplers {
             hidden_states = downsampler.forward(hidden_states);
         }
         hidden_states
@@ -62,11 +63,11 @@ impl DownEncoderBlock2DConfig {
 
         DownEncoderBlock2D {
             resnets,
-            downsampler: match self.add_downsample {
+            downsamplers: match self.add_downsample {
                 true => {
-                    Some(Downsample2DConfig::new(self.out_channels, self.out_channels).init(device))
+                    vec![Downsample2DConfig::new(self.out_channels, self.out_channels).init(device)]
                 }
-                false => None,
+                false => vec![],
             },
         }
     }
@@ -138,6 +139,66 @@ impl UNetMidBlock2DConfig {
         UNetMidBlock2D {
             resnets,
             attentions,
+        }
+    }
+}
+
+// Reference: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/unets/unet_2d_blocks.py#L2575
+#[derive(Module, Debug)]
+pub struct UpDecoderBlock2D<B: Backend> {
+    resnets: Vec<ResnetBlock2D<B>>,
+    upsamplers: Vec<Upsample2D<B>>,
+}
+
+impl<B: Backend> UpDecoderBlock2D<B> {
+    pub fn forward(&self, mut hidden_states: Tensor<B, 4>) -> Tensor<B, 4> {
+        for resnet in &self.resnets {
+            hidden_states = resnet.forward(hidden_states);
+        }
+        for upsampler in &self.upsamplers {
+            hidden_states = upsampler.forward(hidden_states);
+        }
+        hidden_states
+    }
+}
+
+#[derive(Config, Debug)]
+pub struct UpDecoderBlock2DConfig {
+    in_channels: usize,
+    out_channels: usize,
+    num_layers: usize,
+    resnet_eps: f64,
+    resnet_groups: usize,
+    add_upsample: bool,
+}
+
+impl UpDecoderBlock2DConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> UpDecoderBlock2D<B> {
+        let mut resnets = vec![];
+        for i in 0..self.num_layers {
+            let input_channels = if i == 0 {
+                self.in_channels
+            } else {
+                self.out_channels
+            };
+            resnets.push(
+                ResnetBlock2DConfig::new(
+                    input_channels,
+                    self.out_channels,
+                    self.resnet_eps,
+                    self.resnet_groups,
+                )
+                .init(device),
+            );
+        }
+        UpDecoderBlock2D {
+            resnets,
+            upsamplers: match self.add_upsample {
+                true => {
+                    vec![Upsample2DConfig::new(self.out_channels, self.out_channels).init(device)]
+                }
+                false => vec![],
+            },
         }
     }
 }
